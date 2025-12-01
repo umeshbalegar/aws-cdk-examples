@@ -10,6 +10,9 @@ from aws_cdk import (
     aws_ec2 as ec2,
     aws_iam as iam,
     aws_cloudwatch as cloudwatch_,
+    aws_logs as logs_,
+    aws_s3 as s3_,
+    aws_cloudtrail as cloudtrail_,
     Duration,
 )
 from constructs import Construct
@@ -20,6 +23,31 @@ TABLE_NAME = "demo_table"
 class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
+
+        # CloudTrail S3 bucket
+        trail_bucket = s3_.Bucket(
+            self,
+            "CloudTrailBucket",
+            encryption=s3_.BucketEncryption.S3_MANAGED,
+            block_public_access=s3_.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+        )
+
+        # CloudTrail trail
+        cloudtrail_.Trail(
+            self,
+            "CloudTrail",
+            bucket=trail_bucket,
+            is_multi_region_trail=True,
+            include_global_service_events=True,
+        )
+
+        # VPC Flow Logs log group
+        vpc_flow_log_group = logs_.LogGroup(
+            self,
+            "VpcFlowLogGroup",
+            retention=logs_.RetentionDays.ONE_MONTH,
+        )
 
         # VPC
         vpc = ec2.Vpc(
@@ -32,6 +60,13 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
                     cidr_mask=24
                 )
             ],
+        )
+
+        # Enable VPC Flow Logs
+        vpc.add_flow_log(
+            "FlowLog",
+            destination=ec2.FlowLogDestination.to_cloud_watch_logs(vpc_flow_log_group),
+            traffic_type=ec2.FlowLogTrafficType.ALL,
         )
         
         # Create VPC endpoint
@@ -59,13 +94,15 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             )
         )
 
-        # Create DynamoDb Table
+        # Create DynamoDb Table with PITR and Streams
         demo_table = dynamodb_.Table(
             self,
             TABLE_NAME,
             partition_key=dynamodb_.Attribute(
                 name="id", type=dynamodb_.AttributeType.STRING
             ),
+            point_in_time_recovery=True,
+            stream=dynamodb_.StreamViewType.NEW_AND_OLD_IMAGES,
         )
 
         # Create the Lambda function to receive the request
@@ -83,19 +120,39 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             memory_size=1024,
             timeout=Duration.minutes(5),
             tracing=lambda_.Tracing.ACTIVE,
+            log_retention=logs_.RetentionDays.ONE_MONTH,
         )
 
         # grant permission to lambda to write to demo table
         demo_table.grant_write_data(api_hanlder)
         api_hanlder.add_environment("TABLE_NAME", demo_table.table_name)
 
-        # Create API Gateway
+        # API Gateway access logs log group
+        api_log_group = logs_.LogGroup(
+            self,
+            "ApiGatewayAccessLogs",
+            retention=logs_.RetentionDays.ONE_MONTH,
+        )
+
+        # Create API Gateway with access logging
         apigw_.LambdaRestApi(
             self,
             "Endpoint",
             handler=api_hanlder,
             deploy_options=apigw_.StageOptions(
                 tracing_enabled=True,
+                access_log_destination=apigw_.LogGroupLogDestination(api_log_group),
+                access_log_format=apigw_.AccessLogFormat.json_with_standard_fields(
+                    caller=True,
+                    http_method=True,
+                    ip=True,
+                    protocol=True,
+                    request_time=True,
+                    resource_path=True,
+                    response_length=True,
+                    status=True,
+                    user=True,
+                ),
             ),
         )
 
